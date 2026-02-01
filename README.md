@@ -7,7 +7,7 @@
 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/ghostmcf/RealityGhost/main/RealityGhost.sh) install
-
+```
 
 RealityGhost یک اسکریپت **production‑grade، ایمن و stealth‑محور** برای راه‌اندازی و مدیریت Xray Reality (VLESS) است که بر اساس **مشاهدات میدانی، لاگ‌های عملیاتی و گزارش‌های واقعی از نحوه فیلترینگ در ایران** طراحی شده است.
 
