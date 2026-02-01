@@ -37,6 +37,11 @@ EXTRA_UUID="0cd3e743-f8dd-4b10-82f8-f6c35e17f182"  # fixed guest subscription
 DOH_SERVER="https://dns.google/dns-query"
 SERVER_IP="91.107.158.133"
 DEFAULT_TRANSPORT="tcp"  # xhttp|tcp
+XHTTP_HOST_DEFAULT="www.gstatic.com"
+# ajax.googleapis.com
+# fonts.gstatic.com
+# www.gstatic.com
+
 
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
 err(){ echo "ERROR: $*" >&2; }
@@ -61,12 +66,59 @@ set_transport(){
   local t="${1:-}"
   [[ "$t" != "tcp" && "$t" != "xhttp" ]] && { err "Invalid transport: $t"; return 1; }
   echo "$t" > "$TRANSPORT_FILE"
-  log "Transport set to: $t"
+  log "Transport set to: Dual Mode , XHTTP and TCP Both enabled"
 }
 
 # ────────────────────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────────────────────
+
+health_check() {
+  log "→ Running health check (XRAY${1:+ + NGINX})"
+
+  # --- XRAY config ---
+  if ! xray_test_config; then
+    err "HealthCheck: xray config invalid"
+    return 1
+  fi
+
+  # --- XHTTP path ---
+  local path
+  path="$(get_xhttp_path)"
+
+  if [[ -z "$path" ]]; then
+    err "HealthCheck: xhttp path missing in config"
+    return 1
+  fi
+
+  log "✔ XHTTP path detected → /$path"
+
+  # --- nginx (ONLY if requested) ---
+  if [[ "${1:-}" == "nginx" ]]; then
+    if ! command -v nginx >/dev/null 2>&1; then
+      err "HealthCheck: nginx not installed"
+      return 1
+    fi
+
+    if ! nginx -t >/dev/null 2>&1; then
+      err "HealthCheck: nginx config invalid"
+      return 1
+    fi
+
+    if ! systemctl is-active --quiet nginx; then
+      err "HealthCheck: nginx not running"
+      return 1
+    fi
+
+    log "✔ NGINX is running"
+  fi
+
+  log "✔ Health check PASSED"
+  return 0
+}
+
+
+
 
 xray_bin(){
   if [[ -x "$XRAY_DIR/xray" ]]; then echo "$XRAY_DIR/xray"; return 0; fi
@@ -80,29 +132,25 @@ xray_test_config(){
 }
 
 xray_gen_keys(){
-  local out bin attempt priv pub
-  bin=$(xray_bin) || true
-  [[ -z "${bin:-}" ]] && { err "Xray binary not found for keygen"; return 1; }
+  local bin out priv pub
 
-  for attempt in {1..8}; do
-    out=$("$bin" x25519 2>&1 || true)
-    priv=$(awk -F': *' 'tolower($0) ~ /private/ { gsub(/\r/,"",$2); print $2; exit }' <<<"$out")
-    pub=$(awk  -F': *' 'tolower($0) ~ /public/  { gsub(/\r/,"",$2); print $2; exit }' <<<"$out")
+  bin=$(xray_bin)
+  [[ -z "$bin" ]] && { err "Xray binary not found"; return 1; }
 
-    if [[ -z "${priv:-}" || -z "${pub:-}" ]]; then
-      mapfile -t _k < <(grep -Eo '[A-Za-z0-9+/=]{40,90}' <<<"$out" | tail -n2)
-      priv=${_k[0]:-}; pub=${_k[1]:-}
-    fi
+  out=$("$bin" x25519 2>/dev/null)
 
-    if [[ -n "${priv:-}" && -n "${pub:-}" && "$priv" != "$pub" ]]; then
-      echo "$priv $pub"; return 0
-    fi
-    sleep 0.2
-  done
+  priv=$(awk -F': ' '/PrivateKey:/ {print $2}' <<<"$out")
+  pub=$(awk -F': ' '/Password:/   {print $2}' <<<"$out")
 
-  err "Keygen failed (priv/pub parse bug)"
-  return 1
+  [[ -n "$priv" && -n "$pub" ]] || {
+    err "x25519 output unparsable"
+    echo "$out" >&2
+    return 1
+  }
+
+  echo "$priv $pub"
 }
+
 
 detect_ip(){
   log "IP detection started …"
@@ -131,9 +179,22 @@ ensure_config_file() {
 EOF
   fi
 
-  # 🔴 CRITICAL: normalize structure
+  # 🔴 normalize structure safely
   local tmp
-  tmp=$(tmpfile)
+  tmp=$(mktemp /tmp/ghost.XXXXXX)
+
+  # اگر فایل خراب بود، اول JSON رو بازنویسی می‌کنیم
+  if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+    log "⚠️ Warning: config.json corrupted, resetting base structure …"
+    cat >"$CONFIG_FILE" <<'EOF'
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [],
+  "outbounds": [{ "protocol": "freedom", "settings": {} }]
+}
+EOF
+  fi
+
   jq '
     .inbounds = (.inbounds // [])
     | if (.inbounds | length) == 0 then
@@ -141,31 +202,51 @@ EOF
           "listen": "127.0.0.1",
           "port": 8444,
           "protocol": "vless",
-          "settings": {
-            "clients": [],
-            "decryption": "none"
-          },
-          "streamSettings": {
-            "network": "tcp",
-            "security": "reality",
-            "realitySettings": {},
-            "tlsSettings": {}
-          },
+          "settings": { "clients": [], "decryption": "none" },
+          "streamSettings": { "network": "tcp", "security": "reality", "realitySettings": {}, "tlsSettings": {} },
           "tag": "RealityVLESS"
         }]
       else .
       end
   ' "$CONFIG_FILE" >"$tmp" && mv "$tmp" "$CONFIG_FILE"
+
+  log "✅ Config normalized"
+}
+
+save_xhttp_path() {
+  local p="$1"
+  local tmp
+
+  [[ -z "$p" ]] && { err "save_xhttp_path: empty path"; return 1; }
+
+  ensure_config_file
+
+  tmp=$(tmpfile)
+  jq --arg v "/$p" '
+    .inbounds |= map(
+      if .streamSettings.network == "xhttp" then
+        .streamSettings.xhttpSettings = {
+          "path": $v,
+          "mode": "packet-up"
+        }
+      else .
+      end
+    )
+  ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+
+  log "XHTTP path saved → /$p"
+  return 0
 }
 
 
 get_xhttp_path() {
-  ensure_config_file
-
   jq -r '
-    (.inbounds[0].streamSettings.xhttpSettings.path // empty)
-  ' "$CONFIG_FILE" 2>/dev/null | sed 's|^/||'
+    .inbounds[]
+    | select(.streamSettings.network=="xhttp")
+    | .streamSettings.xhttpSettings.path // empty
+  ' "$CONFIG_FILE" 2>/dev/null | head -n1 | sed 's|^/||'
 }
+
 
 
 
@@ -203,27 +284,60 @@ rand_hex() {
 }
 
 
-write_config(){
+write_config() {
   log "Writing Xray config …"
+
   mkdir -p /var/log/xray "$XRAY_DIR" "$SCRIPT_DIR" "$SUB_DIR"
   ensure_config_file
 
+  # ===== Reality keypair =====
   local keys PRIV PUB
-  keys=$(xray_gen_keys) || { err "Failed keygen"; exit 1; }
-  PRIV=$(cut -d' ' -f1 <<<"$keys")
-  PUB=$(cut -d' ' -f2 <<<"$keys")
-  echo "$PUB" > "$PUBKEY_FILE"   # subscriptions only
+  keys=$(xray_gen_keys) || { err "Reality keygen failed"; return 1; }
+  PRIV=$(awk '{print $1}' <<<"$keys")
+  PUB=$(awk '{print $2}' <<<"$keys")
+  echo "$PUB" > "$PUBKEY_FILE"   # only for subscriptions
 
-  local SID FP PATH_X TRANSPORT STREAM_SETTINGS tmp
-  SID=$(rand_hex 8)
-  FP=$(shuf -e chrome edge firefox safari -n1)
-  TRANSPORT=$(get_transport)
+  # ===== Shared params =====
+  local SID FP PATH_X
+  SID="$(rand_hex 8)"
+  FP="$(shuf -e chrome edge firefox safari -n1)"
 
+  # ---- stable XHTTP path (CRITICAL) ----
   PATH_X="$(get_xhttp_path)"
-  [[ -z "$PATH_X" ]] && PATH_X="$(rand_hex 8)"
+  if [[ -z "$PATH_X" ]]; then
+    PATH_X="$(rand_hex 8)"
+  fi
 
-  if [[ "$TRANSPORT" == "xhttp" ]]; then
-    STREAM_SETTINGS=$(cat <<EOF
+  # ===== Stream settings: TCP Reality =====
+  local STREAM_TCP
+  STREAM_TCP=$(cat <<EOF
+{
+  "network": "tcp",
+  "security": "reality",
+  "realitySettings": {
+    "xver": 0,
+    "show": false,
+    "dest": "google.com:443",
+    "serverNames": [
+      "google.com",
+      "www.gstatic.com",
+      "fonts.gstatic.com"
+    ],
+    "privateKey": "$PRIV",
+    "shortIds": ["$SID"]
+  },
+  "tlsSettings": {
+    "fingerprint": "$FP",
+    "alpn": ["h2","http/1.1"],
+    "enablePQTls": true
+  }
+}
+EOF
+)
+
+  # ===== Stream settings: XHTTP Reality (nginx-backed) =====
+  local STREAM_XHTTP
+  STREAM_XHTTP=$(cat <<EOF
 {
   "network": "xhttp",
   "security": "reality",
@@ -231,7 +345,11 @@ write_config(){
     "xver": 0,
     "show": false,
     "dest": "google.com:443",
-    "serverNames": ["google.com","www.gstatic.com","fonts.gstatic.com"],
+    "serverNames": [
+      "google.com",
+      "www.gstatic.com",
+      "fonts.gstatic.com"
+    ],
     "privateKey": "$PRIV",
     "shortIds": ["$SID"]
   },
@@ -241,66 +359,64 @@ write_config(){
   },
   "tlsSettings": {
     "fingerprint": "$FP",
-    "alpn": ["h2", "http/1.1"],
+    "alpn": ["h2"],
     "enablePQTls": true
   }
 }
 EOF
 )
-  else
-    STREAM_SETTINGS=$(cat <<EOF
-{
-  "network": "tcp",
-  "security": "reality",
-  "realitySettings": {
-    "xver": 0,
-    "show": false,
-    "dest": "google.com:443",
-    "serverNames": ["google.com","www.gstatic.com","fonts.gstatic.com"],
-    "privateKey": "$PRIV",
-    "shortIds": ["$SID"]
-  },
-  "tlsSettings": {
-    "fingerprint": "$FP",
-    "alpn": ["h2", "http/1.1"],
-    "enablePQTls": true
-  }
-}
-EOF
-)
-  fi
-  echo "$STREAM_SETTINGS" >/dev/null
+
+  # ===== Write final config =====
   cat > "$CONFIG_FILE" <<EOF
 {
-  "log": {"access": "/dev/null", "error": "/var/log/xray/err.log", "loglevel": "warning"},
-  "dns": {"servers": ["$DOH_SERVER","1.1.1.1","8.8.8.8"]},
+  "log": {
+    "access": "/dev/null",
+    "error": "/var/log/xray/err.log",
+    "loglevel": "warning"
+  },
+
   "inbounds": [
     {
+      "tag": "reality-tcp",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "$UUID", "flow": "" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": $STREAM_TCP
+    },
+    {
+      "tag": "reality-xhttp",
       "listen": "127.0.0.1",
       "port": 8444,
       "protocol": "vless",
       "settings": {
         "clients": [
-          {"id": "$UUID", "flow": ""},
-          {"id": "$EXTRA_UUID", "flow": ""}
+          { "id": "$UUID", "flow": "" }
         ],
         "decryption": "none"
       },
-      "streamSettings": $STREAM_SETTINGS,
-      "tag": "RealityVLESS"
+      "streamSettings": $STREAM_XHTTP
     }
   ],
+
   "outbounds": [
-    {"protocol": "freedom", "settings": {}, "tag": "direct"},
-    {"protocol": "blackhole", "settings": {"response": {"type":"http"}}, "tag": "blocked"}
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "blocked" }
   ]
 }
 EOF
 
-  tmp=$(tmpfile)
-  jq 'del(.inbounds[0].streamSettings.realitySettings.pbk)' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-  log "Xray config written (transport=$(get_transport)) → $CONFIG_FILE"
+  log "✅ Xray config written:"
+  log "   - Reality TCP : 0.0.0.0:443"
+  log "   - Reality XHTTP (nginx) : 127.0.0.1:8444"
+  log "   - XHTTP path : /$PATH_X"
 }
+
 
 write_xray_service(){
   log "Writing systemd unit for Xray …"
@@ -326,165 +442,179 @@ EOF
 # Ensure config has essentials for current transport
 # ────────────────────────────────────────────────────────────────
 
-# ensure_keys_sid_and_path(){
-#   local sid pk keys priv pub tmp dest tr path
-#   ensure_config_file
-#   tr=$(get_transport)
-#   sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$CONFIG_FILE" 2>/dev/null || true)
-#   pk=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$CONFIG_FILE" 2>/dev/null || true)
-
-#   if [[ -z "${pk:-}" || ! -s "$PUBKEY_FILE" ]]; then
-#     log "Reality keys missing/invalid → regenerating …"
-#     keys=$(xray_gen_keys) || { err "Keygen failed"; return 1; }
-#     priv=$(cut -d' ' -f1 <<<"$keys")
-#     pub=$(cut -d' ' -f2 <<<"$keys")
-#     echo "$pub" > "$PUBKEY_FILE"
-
-#     tmp=$(tmpfile)
-#     jq --arg pk "$priv" '
-#       .inbounds[0].streamSettings.realitySettings.privateKey=$pk
-#       | del(.inbounds[0].streamSettings.realitySettings.pbk)
-#     ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-#   fi
-
-#   if [[ -z "${sid:-}" ]]; then
-#     log "shortId missing → creating one …"
-#     SID=$(rand_hex 8)
-#     tmp=$(tmpfile)
-#     jq --arg s "$SID" '.inbounds[0].streamSettings.realitySettings.shortIds=[ $s ]'
-#       "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-#   fi
-
-#   dest=$(jq -r '.inbounds[0].streamSettings.realitySettings.dest // empty' "$CONFIG_FILE" 2>/dev/null || true)
-#   if [[ -z "$dest" ]]; then
-#     tmp=$(tmpfile)
-#     jq '
-#       .inbounds[0].streamSettings.realitySettings.dest="google.com:443"
-#       | .inbounds[0].streamSettings.realitySettings.serverNames=["google.com","www.gstatic.com","fonts.gstatic.com"]
-#     ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-#   fi
-
-#   if [[ "$tr" == "xhttp" ]]; then
-#     path=$(get_xhttp_path)
-#     [[ -z "$path" ]] && path="$(rand_hex 8)"
-
-#     tmp=$(tmpfile)
-#     jq --arg p "/$path" '
-#         .inbounds[0].streamSettings.network="xhttp"
-#         | .inbounds[0].streamSettings.xhttpSettings = {
-#             "path": $p,
-#             "mode": "packet-up"
-#         }
-#     ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-#     else
-#     tmp=$(tmpfile)
-#     jq '
-#         .inbounds[0].streamSettings.network="tcp"
-#         | del(.inbounds[0].streamSettings.xhttpSettings)
-#     ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-#     fi
-
-
-# #   tmp=$(tmpfile)
-# #   jq 'del(.inbounds[0].streamSettings.realitySettings.pbk)' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-#   return 0
-# }
-
-ensure_keys_sid_and_path(){
+ensure_keys_sid_and_path() {
   ensure_config_file
 
-  local tmp sid pk dest
-  sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$CONFIG_FILE")
-  pk=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$CONFIG_FILE")
+  local sid priv pub keys tmp
+  local path
 
-  # keys
-  if [[ -z "$pk" || ! -s "$PUBKEY_FILE" ]]; then
-    local keys priv pub
+  #
+  # ===== Reality keypair (shared for ALL inbounds) =====
+  #
+  priv=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$CONFIG_FILE")
+
+  if [[ -z "$priv" || ! -s "$PUBKEY_FILE" ]]; then
+    log "Reality keys missing → regenerating"
+
     keys=$(xray_gen_keys) || return 1
-    priv=$(cut -d' ' -f1 <<<"$keys")
-    pub=$(cut -d' ' -f2 <<<"$keys")
+    priv=$(awk '{print $1}' <<<"$keys")
+    pub=$(awk '{print $2}' <<<"$keys")
     echo "$pub" > "$PUBKEY_FILE"
 
     tmp=$(tmpfile)
     jq --arg pk "$priv" '
-      .inbounds[0].streamSettings.realitySettings.privateKey=$pk
-      | del(.inbounds[0].streamSettings.realitySettings.pbk)
+      .inbounds[].streamSettings.realitySettings.privateKey = $pk
+      | del(.inbounds[].streamSettings.realitySettings.pbk)
     ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
   fi
 
-  # shortId
+  #
+  # ===== ShortID (shared) =====
+  #
+  sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$CONFIG_FILE")
+
   if [[ -z "$sid" ]]; then
-    sid=$(rand_hex 8)
+    sid="$(rand_hex 8)"
     tmp=$(tmpfile)
     jq --arg s "$sid" '
-      .inbounds[0].streamSettings.realitySettings.shortIds=[ $s ]
+      .inbounds[].streamSettings.realitySettings.shortIds = [ $s ]
     ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
   fi
 
-  # force TCP
+  #
+  # ===== Reality dest + serverNames (fake CDN) =====
+  #
   tmp=$(tmpfile)
   jq '
-    .inbounds[0].streamSettings.network="tcp"
-    | del(.inbounds[0].streamSettings.xhttpSettings)
+    .inbounds[].streamSettings.realitySettings.dest = "google.com:443"
+    | .inbounds[].streamSettings.realitySettings.serverNames = [
+        "google.com",
+        "www.gstatic.com",
+        "fonts.gstatic.com"
+      ]
   ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
 
-  # dest / sni
-  dest=$(jq -r '.inbounds[0].streamSettings.realitySettings.dest // empty' "$CONFIG_FILE")
-  if [[ -z "$dest" ]]; then
-    tmp=$(tmpfile)
-    jq '
-      .inbounds[0].streamSettings.realitySettings.dest="google.com:443"
-      | .inbounds[0].streamSettings.realitySettings.serverNames=["google.com","www.gstatic.com","fonts.gstatic.com"]
-    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+  #
+  # ===== Ensure XHTTP PATH exists (STATE, not config) =====
+  #
+  path="$(get_xhttp_path)"
+  if [[ -z "$path" ]]; then
+    path="$(rand_hex 8)"
+    save_xhttp_path "$path"
+    log "Generated new XHTTP path: /$path"
   fi
+
+  return 0
 }
+
+
+
 
 
 # ────────────────────────────────────────────────────────────────
 # Subscription builders (respect transport)
 # ────────────────────────────────────────────────────────────────
 
-build_vless_uri(){
-  local u="$1" sni="$2" tag="$3"
-  local IP SID FP PB tr path uri
 
-  tr=$(get_transport)
-  IP=$SERVER_IP
+
+build_vless_uri_tcp() {
+  local u="$1" sni="$2" tag="$3"
+  local IP SID FP PB uri
+
+  IP="$SERVER_IP"
+
   SID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$CONFIG_FILE")
   FP=$(jq -r  '.inbounds[0].streamSettings.tlsSettings.fingerprint // empty' "$CONFIG_FILE")
   PB=$(<"$PUBKEY_FILE")
-  path=$(get_xhttp_path)
 
-  [[ -z "$PB" ]] && { err "Empty publicKey file"; return 1; }
+  [[ -z "$PB"  ]] && { err "Empty publicKey file"; return 1; }
   [[ -z "$SID" ]] && { err "Empty shortId"; return 1; }
 
+  # fallback safety
+  [[ -z "$FP" ]] && FP="chrome"
+
   uri="vless://$u@$IP:443?encryption=none&security=reality"
-  # if [[ "$tr" == "xhttp" ]]; then
-  #   [[ -z "$path" ]] && { err "Empty xhttp path"; return 1; }
-  #   uri+="&type=xhttp&mode=packet-up&path=/$path"
-  # else
-  #   uri+="&type=tcp"
-  # fi
   uri+="&type=tcp"
-  uri+="&sni=$sni&fp=$FP&alpn=h2&pbk=$PB&sid=$SID#${tag}"
+  uri+="&sni=$sni"
+  uri+="&host=$sni"
+  uri+="&fp=$FP"
+  uri+="&alpn=h2,http/1.1"
+  uri+="&pbk=$PB"
+  uri+="&sid=$SID"
+  uri+="#${tag}-TCP"
+
   echo "$uri"
 }
 
-generate_one_subscription(){
+
+build_vless_uri_xhttp() {
+  local u="$1" sni="$2" tag="$3"
+  local IP SID FP PB path uri host
+
+  IP="$SERVER_IP"
+
+  # 🔐 HTTP Host MUST match nginx + cert
+  host="$domain"
+
+  SID=$(jq -r '.inbounds[].streamSettings.realitySettings.shortIds[0] // empty' "$CONFIG_FILE" | head -n1)
+  FP=$(jq -r  '.inbounds[].streamSettings.tlsSettings.fingerprint // empty' "$CONFIG_FILE" | head -n1)
+  PB=$(<"$PUBKEY_FILE")
+  path=$(get_xhttp_path)
+
+  [[ -z "$PB"   ]] && { err "Empty publicKey file"; return 1; }
+  [[ -z "$SID"  ]] && { err "Empty shortId"; return 1; }
+  [[ -z "$path" ]] && { err "Empty xhttp path"; return 1; }
+
+  uri="vless://$u@$IP:443?encryption=none&security=reality"
+  uri+="&type=xhttp"
+  uri+="&mode=packet-up"
+  uri+="&path=/$path"
+
+  # 👇 critical for nginx + DPI
+  uri+="&host=$sni"
+
+  # 👇 Reality camouflage
+  uri+="&sni=$sni"
+  uri+="&fp=$FP"
+
+  # safer than forcing h2 everywhere
+  uri+="&alpn=h2,http/1.1"
+
+  uri+="&pbk=$PB"
+  uri+="&sid=$SID"
+  uri+="#${tag}-XHTTP"
+
+  echo "$uri"
+}
+
+
+
+
+generate_one_subscription() {
   local U="$1" PREFIX="$2"
   local RAW_FILE URL
   ensure_keys_sid_and_path || return 1
 
-  RAW_FILE="$SUB_DIR/$U.raw"; : > "$RAW_FILE"
+  RAW_FILE="$SUB_DIR/$U.raw"
+  : > "$RAW_FILE"
+
   local -a SNIS=(google.com www.gstatic.com fonts.gstatic.com)
 
   for i in {0..2}; do
-    local sni tag uri
+    local sni tag
     sni="${SNIS[i]}"
-    if (( i == 0 )); then tag="${PREFIX}"; else tag="${PREFIX}-Backup${i}"; fi
-    uri=$(build_vless_uri "$U" "$sni" "$tag")
-    echo "# $tag (transport=$(get_transport), SNI=$sni)" >>"$RAW_FILE"
-    echo "$uri" >>"$RAW_FILE"
+    if (( i == 0 )); then
+      tag="${PREFIX}"
+    else
+      tag="${PREFIX}-Backup${i}"
+    fi
+
+    echo "# $tag | TCP | SNI=$sni" >>"$RAW_FILE"
+    build_vless_uri_tcp   "$U" "$sni" "$tag" >>"$RAW_FILE"
+    echo >>"$RAW_FILE"
+
+    echo "# $tag | XHTTP | SNI=$sni" >>"$RAW_FILE"
+    build_vless_uri_xhttp "$U" "$sni" "$tag" >>"$RAW_FILE"
     echo >>"$RAW_FILE"
   done
 
@@ -493,20 +623,22 @@ generate_one_subscription(){
   log "Subscription URL: $URL"
 }
 
+
+
 generate_subscription(){
   log "→ Regenerating subscriptions (transport=$(get_transport)) …"
   mkdir -p "$SUB_DIR"
 
   generate_one_subscription "$UUID" "RealityGhost"
-  generate_one_subscription "$EXTRA_UUID" "Guest"
+  # generate_one_subscription "$EXTRA_UUID" "Guest"
 
   if command -v qrencode >/dev/null 2>&1; then
     echo
     log "QR (Main): https://$domain/$UUID"
     qrencode -t ANSIUTF8 "https://$domain/$UUID" || true
     echo
-    log "QR (Guest): https://$domain/$EXTRA_UUID"
-    qrencode -t ANSIUTF8 "https://$domain/$EXTRA_UUID" || true
+    # log "QR (Guest): https://$domain/$EXTRA_UUID"
+    # qrencode -t ANSIUTF8 "https://$domain/$EXTRA_UUID" || true
   fi
 
   log "✔ Subscriptions regenerated"
@@ -523,233 +655,281 @@ generate_subscription(){
 # NGINX (unchanged idea)
 # ────────────────────────────────────────────────────────────────
 
-write_nginx(){
+write_nginx() {
   log "Installing & configuring NGINX …"
-  rm -f /etc/nginx/sites-enabled/default || true
+
+  # --- پاک کردن کانفیگ قدیمی ---
+  rm -f /etc/nginx/sites-enabled/ghost_https.conf
+  rm -f /etc/nginx/sites-available/ghost_https.conf
   mkdir -p "$SUB_DIR" /var/www/ghost_web
-  echo '<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>It works.</h1></body></html>' > /var/www/ghost_web/index.html
 
-  systemctl stop nginx || true
+  # --- صفحه پیش‌فرض ---
+  cat > /var/www/ghost_web/index.html <<'HTML'
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Welcome</title></head>
+<body><h1>It works.</h1></body>
+</html>
+HTML
 
-  if ! certbot certonly --standalone -d "$domain" --non-interactive --agree-tos -m "$help_email"; then
-    err "Certbot failed."
-    [[ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]] || { err "No certificate present. Aborting."; return 1; }
-    log "Using existing certificate for $domain."
+  # --- نصب nginx و certbot plugin ---
+  if ! command -v nginx >/dev/null 2>&1; then
+    apt-get update -y
+    apt-get install -y nginx python3-certbot-nginx || {
+      err "Failed to install NGINX or Certbot plugin"
+      return 1
+    }
+  else
+    apt-get install -y python3-certbot-nginx || true
   fi
 
-  [[ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]] || { err "Certificate missing. Aborting."; return 1; }
+  # --- توقف nginx قبل از تغییر کانفیگ ---
+  systemctl stop nginx || true
 
-  cat > "$NGINX_SITE" <<EOF
+  # --- TLS cert ---
+  if ! certbot certonly --nginx -d "$domain" --non-interactive --agree-tos -m "$help_email"; then
+    err "Certbot failed. Trying webroot fallback…"
+    if [[ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]]; then
+      log "Using existing certificate for $domain."
+    else
+      certbot certonly --webroot -w /var/www/ghost_web -d "$domain" --non-interactive --agree-tos -m "$help_email" || {
+        err "Certbot webroot also failed. TLS not configured."
+      }
+    fi
+  fi
+
+  # --- ساخت کانفیگ جدید nginx ---
+  cat > /etc/nginx/sites-available/ghost_https.conf <<EOF
 server {
-    listen 127.0.0.1:8443 ssl http2;
+    listen 443 ssl http2;
     server_name $domain;
+
     ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
 
-    location = /$UUID { alias $SUB_DIR/$UUID; default_type text/plain; add_header Content-Disposition ""; }
-    location = /$EXTRA_UUID { alias $SUB_DIR/$EXTRA_UUID; default_type text/plain; add_header Content-Disposition ""; }
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
 
-    location / { root /var/www/ghost_web; index index.html; }
+    # ---- subscriptions ----
+    location = /$UUID {
+        alias $SUB_DIR/$UUID;
+        default_type text/plain;
+        add_header Content-Type text/plain;
+        add_header Cache-Control "no-store";
+    }
+
+    
+
+    # ---- Reality XHTTP ----
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_pass http://127.0.0.1:8444;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
 }
 EOF
-  ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/ghost_https.conf
 
+  ln -sf /etc/nginx/sites-available/ghost_https.conf /etc/nginx/sites-enabled/ghost_https.conf
+
+  # --- minimal nginx.conf ---
   cat > /etc/nginx/nginx.conf <<'EOF'
 user www-data;
 worker_processes auto;
 pid /run/nginx.pid;
 
-load_module /usr/lib/nginx/modules/ngx_stream_module.so;
-
-events { worker_connections 4096; }
+events {
+    worker_connections 4096;
+}
 
 http {
     include       /etc/nginx/mime.types;
-    default_type  text/html;
+    default_type  application/octet-stream;
     sendfile      on;
     keepalive_timeout 65;
+
+    access_log off;
+    error_log /var/log/nginx/error.log warn;
+
     include /etc/nginx/sites-enabled/*.conf;
 }
-
-stream {
-    map $ssl_preread_server_name $backend {
-        ~*^google\.com$           xray;
-        ~*^www\.gstatic\.com$    xray;
-        ~*^fonts\.gstatic\.com$  xray;
-        default                  subscribe;
-    }
-    upstream subscribe { server 127.0.0.1:8443; }
-    upstream xray      { server 127.0.0.1:8444; }
-    server {
-        listen 443 reuseport backlog=8192;
-        proxy_connect_timeout 10s;
-        proxy_timeout 300s;
-        ssl_preread on;
-        proxy_pass $backend;
-    }
-}
 EOF
 
-  nginx -t && systemctl restart nginx
-  log "NGINX configured"
+  # --- بررسی پورت 443 ---
+  if ss -tuln | grep -q ':443'; then
+    log "Port 443 busy. Attempting to stop conflicting service…"
+    fuser -k 443/tcp || true
+  fi
+
+  # --- تست و ریستارت nginx ---
+  if nginx -t; then
+    systemctl restart nginx || {
+      err "NGINX failed to start. Check journalctl -xeu nginx.service"
+      return 1
+    }
+    log "✅ NGINX ready on :443 (TLS + Subscription + XHTTP)"
+  else
+    err "NGINX config test failed"
+    return 1
+  fi
 }
 
-update_nginx_uuid(){
-  cat > "$NGINX_SITE" <<EOF
-server {
-    listen 127.0.0.1:8443 ssl http2;
-    server_name $domain;
-    ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
 
-    location = /$UUID { alias $SUB_DIR/$UUID; default_type text/plain; add_header Content-Disposition ""; }
-    location = /$EXTRA_UUID { alias $SUB_DIR/$EXTRA_UUID; default_type text/plain; add_header Content-Disposition ""; }
 
-    location / { root /var/www/ghost_web; index index.html; }
+update_nginx_uuid() {
+  if [[ -z "$NGINX_SITE" || ! -f "$NGINX_SITE" ]]; then
+    err "NGINX_SITE not set or file does not exist"
+    return 1
+  fi
+
+  sed -i "s|location = /[a-f0-9-]\+ {|location = /$UUID {|" "$NGINX_SITE"
+
+  nginx -t && systemctl reload nginx
+  log "✅ Updated subscription UUIDs (XHTTP untouched)"
 }
-EOF
-  ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/ghost_https.conf
-  nginx -t && systemctl restart nginx
-  log "✅ Updated NGINX → UUID=$UUID | EXTRA_UUID=$EXTRA_UUID"
-}
+
+
 
 # ────────────────────────────────────────────────────────────────
 # SAFE Rotate (manual)
 # ────────────────────────────────────────────────────────────────
 
-manual_rotate_all(){
+manual_rotate_all() {
   clear
-  log "→ Manual rotation (transport=$(get_transport)) …"
+  log "→ Manual rotation (dual-inbound SAFE) …"
   log "→ SAFE MODE: keys/path are NOT rotated unless ROTATE_KEYS=1 / ROTATE_PATH=1"
+
   ensure_config_file
-  local tmp old_fp new_fp newsid keepN
+  local tmp bak old_fp new_fp newsid keepN
   keepN=6
 
-  # Backup for rollback
-  local bak
+  # ── Backup for rollback
   bak=$(tmpfile)
   cp -f "$CONFIG_FILE" "$bak"
 
-  # 1) Fingerprint rotate (safe)
-  old_fp=$(jq -r '.inbounds[0].streamSettings.tlsSettings.fingerprint' "$CONFIG_FILE")
+  # ── 1) Fingerprint rotate (ALL inbounds)
+  old_fp=$(jq -r '
+    .inbounds[].streamSettings.tlsSettings.fingerprint // empty
+  ' "$CONFIG_FILE" | head -n1)
+
   while :; do
     new_fp=$(shuf -e chrome edge firefox safari -n1)
     [[ -n "$new_fp" && "$new_fp" != "$old_fp" ]] && break
   done
+
   tmp=$(tmpfile)
-  jq --arg p "$new_fp" '.inbounds[0].streamSettings.tlsSettings.fingerprint=$p' \
-     "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+  jq --arg fp "$new_fp" '
+    .inbounds |= map(
+      .streamSettings.tlsSettings.fingerprint = $fp
+    )
+  ' "$CONFIG_FILE" >"$tmp" && mv "$tmp" "$CONFIG_FILE"
+
   log "Rotated Fingerprint → $new_fp"
 
-  # 2) ShortId: APPEND (keep last N)  ✅ مهم‌ترین اصلاح
+  # ── 2) ShortId append (shared, keep last N)
   newsid=$(rand_hex 8)
   tmp=$(tmpfile)
   jq --arg s "$newsid" --argjson n "$keepN" '
-    .inbounds[0].streamSettings.realitySettings.shortIds =
-      (([ $s ] + (.inbounds[0].streamSettings.realitySettings.shortIds // []))[:$n])
-  ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-  log "Appended ShortID → $newsid (kept up to $keepN)"
+    .inbounds |= map(
+      .streamSettings.realitySettings.shortIds =
+        (([ $s ] + (.streamSettings.realitySettings.shortIds // []))[:$n])
+    )
+  ' "$CONFIG_FILE" >"$tmp" && mv "$tmp" "$CONFIG_FILE"
 
-  # 3) Keys rotate only if explicitly requested (HARD)
+  log "Appended ShortID → $newsid (keep $keepN)"
+
+  # ── 3) HARD rotate: Reality keys (ALL inbounds)
   if [[ "${ROTATE_KEYS:-0}" == "1" ]]; then
-    log "HARD ROTATE: rotating Reality keys (old clients WILL drop)"
+    log "HARD ROTATE: rotating Reality keys (clients WILL drop)"
     local keys priv pub
-    keys=$(xray_gen_keys) || { err "Keygen failed"; cp -f "$bak" "$CONFIG_FILE"; return 1; }
+    keys=$(xray_gen_keys) || {
+      err "Keygen failed"; cp -f "$bak" "$CONFIG_FILE"; return 1;
+    }
     priv=$(cut -d' ' -f1 <<<"$keys")
     pub=$(cut -d' ' -f2 <<<"$keys")
+    echo "$pub" > "$PUBKEY_FILE"
 
     tmp=$(tmpfile)
     jq --arg pk "$priv" '
-      .inbounds[0].streamSettings.realitySettings.privateKey=$pk
-      | del(.inbounds[0].streamSettings.realitySettings.pbk)
-    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-    echo "$pub" > "$PUBKEY_FILE"
-    log "Rotated Reality keys → public key updated"
+      .inbounds |= map(
+        .streamSettings.realitySettings.privateKey = $pk
+        | del(.streamSettings.realitySettings.pbk)
+      )
+    ' "$CONFIG_FILE" >"$tmp" && mv "$tmp" "$CONFIG_FILE"
+
+    log "Rotated Reality keys"
   fi
 
-  # 4) XHTTP path rotate only if explicitly requested (HARD) and only in xhttp
-  if [[ "$(get_transport)" == "xhttp" && "${ROTATE_PATH:-0}" == "1" ]]; then
-    log "HARD ROTATE: rotating xHTTP path (old clients WILL drop)"
+  # ── 4) HARD rotate: xHTTP path (ONLY xhttp inbounds)
+  if [[ "${ROTATE_PATH:-0}" == "1" ]]; then
     local p
     p=$(rand_hex 8)
     tmp=$(tmpfile)
     jq --arg v "/$p" '
-      .inbounds[0].streamSettings.xhttpSettings.path=$v
-      | .inbounds[0].streamSettings.xhttpSettings.mode="packet-up"
-    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+      .inbounds |= map(
+        if .streamSettings.network == "xhttp" then
+          .streamSettings.xhttpSettings.path = $v
+          | .streamSettings.xhttpSettings.mode = "packet-up"
+        else .
+        end
+      )
+    ' "$CONFIG_FILE" >"$tmp" && mv "$tmp" "$CONFIG_FILE"
+
     log "Rotated xHTTP path → /$p"
   fi
 
-  # Ensure consistency & remove pbk
-  ensure_keys_sid_and_path || { err "ensure failed"; cp -f "$bak" "$CONFIG_FILE"; return 1; }
+  # ── 5) Ensure consistency
+  ensure_keys_sid_and_path || {
+    err "ensure failed"; cp -f "$bak" "$CONFIG_FILE"; return 1;
+  }
 
-  # Validate BEFORE restart, rollback if invalid
+  # ── 6) Validate & restart
   if ! xray_test_config; then
-    err "Config invalid after rotation → rollback"
+    err "Config invalid → rollback"
     cp -f "$bak" "$CONFIG_FILE"
     return 1
   fi
 
-  # Restart services
   systemctl restart xray
   systemctl restart nginx
 
-  # Rebuild subscriptions (now reflect new fp/sid, and keys/path if hard-rotated)
   generate_subscription
 
-  mkdir -p "$SCRIPT_DIR"
-  jq -n --arg ts "$(date -Is)" \
-        --arg tr "$(get_transport)" \
-        --arg fp "$new_fp" \
-        --arg sid_new "$newsid" \
-        --arg sid_active "$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$CONFIG_FILE")" \
-        --arg pb "$(cat "$PUBKEY_FILE" 2>/dev/null || true)" \
-        --arg path "$(get_xhttp_path)" \
-        --arg rotate_keys "${ROTATE_KEYS:-0}" \
-        --arg rotate_path "${ROTATE_PATH:-0}" '
-        {rotated_at:$ts, transport:$tr, fp:$fp, sid_added:$sid_new, sid_active:$sid_active,
-         pbk:$pb, xhttp_path:$path, rotate_keys:$rotate_keys, rotate_path:$rotate_path}
-  ' > "$STATE_FILE"
-
-  log "Rotation complete (SAFE)."
+  log "✔ Rotation complete (dual-inbound SAFE)."
 }
+
 
 # ────────────────────────────────────────────────────────────────
 # Transport switch (core feature)
 # ────────────────────────────────────────────────────────────────
 
-switch_transport(){
-  local cur next tmp path
+switch_transport() {
+  local cur next
+
   cur=$(get_transport)
-  if [[ "$cur" == "xhttp" ]]; then next="tcp"; else next="xhttp"; fi
-
-  log "Switching transport: $cur → $next"
-  set_transport "$next"
-
-  if [[ "$next" == "tcp" ]]; then
-    tmp=$(tmpfile)
-    jq '
-      .inbounds[0].streamSettings.network="tcp"
-      | del(.inbounds[0].streamSettings.xhttpSettings)
-    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+  if [[ "$cur" == "xhttp" ]]; then
+    next="tcp"
   else
-    path=$(get_xhttp_path)
-    [[ -z "$path" ]] && path=$(rand_hex 8)
-    tmp=$(tmpfile)
-    jq --arg p "/$path" '
-      .inbounds[0].streamSettings.network="xhttp"
-      | .inbounds[0].streamSettings.xhttpSettings.path=$p
-      | .inbounds[0].streamSettings.xhttpSettings.mode="packet-up"
-    ' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+    next="xhttp"
   fi
 
-  ensure_keys_sid_and_path
-  xray_test_config || { err "Config invalid after switching transport"; return 1; }
+  log "Switching transport (LINK MODE): $cur → $next"
 
-  systemctl restart xray
-  systemctl restart nginx
+  #  preference 
+  set_transport "$next"
+
+  #path / sid 
+  ensure_keys_sid_and_path
+
+  #  regenerate subscription
   generate_subscription
-  log "✅ Switched transport to $next"
+
+  log "✅ Transport switched to $next (no server restart, no config change)"
 }
 
 # ────────────────────────────────────────────────────────────────
@@ -775,29 +955,27 @@ install(){
   clear
   show_banner
   echo
-  log "=== RealityGhost v3.6.1 Install (Dual-Mode) ==="
-  while true; do
-      domain=$(ask "Subscription Domain: ")
-      [[ -n "$domain" ]] && break
-      echo "⚠ Domain cannot be empty. Please enter a valid domain."
-  done
+  log "=== RealityGhost v3.7.0 Install (Dual-Mode) ==="
+  # while true; do
+  #     domain=$(ask "Subscription Domain: ")
+  #     [[ -n "$domain" ]] && break
+  #     echo "⚠ Domain cannot be empty. Please enter a valid domain."
+  # done
 
-  # Email
-  while true; do
-      help_email=$(ask "Email for Let's Encrypt: ")
-      [[ -n "$help_email" ]] && break
-      echo "⚠ Email cannot be empty. Please enter a valid email."
-  done
+  # # Email
+  # while true; do
+  #     help_email=$(ask "Email for Let's Encrypt: ")
+  #     [[ -n "$help_email" ]] && break
+  #     echo "⚠ Email cannot be empty. Please enter a valid email."
+  # done
+  domain="api4.mindescape.co"
+  help_email="help@mindescape.co"
   echo "$domain" > "$GHOST_CONF"
-
+  echo "$domain"
 
   local t
-  echo "Currentlly Selected Transport is TCP , XHTTP is disabled for now"
-  # t=$(ask "Transport (xhttp/tcp) [default: $DEFAULT_TRANSPORT]: ")
-  # t=${t:-$DEFAULT_TRANSPORT}
-  # [[ "$t" != "xhttp" && "$t" != "tcp" ]] && t="$DEFAULT_TRANSPORT"
-  t="$DEFAULT_TRANSPORT"
-  set_transport "$t"
+  set_transport "$DEFAULT_TRANSPORT"
+  log "Link preference set to: $DEFAULT_TRANSPORT (server runs TCP + XHTTP)"
 
   read -r -p "Generate new UUID? (Y/n): " yn
   yn=${yn:-Y}
@@ -806,8 +984,10 @@ install(){
       log "Generated new UUID → $UUID"
   fi
 
-  apt-get update -y
-  apt-get install -y curl unzip jq openssl ufw qrencode vnstat uuid-runtime nginx libnginx-mod-stream certbot xxd python3
+  echo "UUID=$UUID"
+
+  # apt-get update -y
+  # apt-get install -y curl unzip jq openssl ufw qrencode vnstat uuid-runtime nginx libnginx-mod-stream certbot xxd python3
 
   mkdir -p "$SCRIPT_DIR" "$SUB_DIR"
   echo "$UUID" > "$UUID_FILE"
@@ -822,17 +1002,26 @@ install(){
 #   ver=$(curl -s https://api.github.com/repos/XTLS/xray-core/releases/latest | jq -r .tag_name | sed 's/^v//')  
   curl -L -o /tmp/x.zip "https://github.com/XTLS/xray-core/releases/download/v${XRAYVER}/Xray-linux-64.zip"
   mkdir -p "$XRAY_DIR" && unzip -oq /tmp/x.zip -d "$XRAY_DIR" && chmod +x "$XRAY_DIR/xray"
-  
+  log "Ensuring config file …"
   ensure_config_file
+  log "Writing config file …"
   write_config
+  systemctl restart xray
+  sleep 1
+  log "Writing Xray Service …"
   write_xray_service
+
+  log "Writing Nginx …"
   write_nginx
+  log "Updating Nginx UUID …"
   update_nginx_uuid
 
   tune_kernel || true
   ensure_keys_sid_and_path
   systemctl restart xray
   systemctl restart nginx
+
+  health_check || { err "Refusing to generate broken subscription"; return 1; }
   generate_subscription
 
   echo "0 5 */3 * * root /usr/local/bin/realityghost manual-rotate" > /etc/cron.d/ghost
@@ -877,10 +1066,10 @@ EOF
       1) [[ -f "$SUB_DIR/$UUID" ]] && base64 -d <"$SUB_DIR/$UUID" || err "No subscription file" ;;
       2)
          echo "https://$domain/$UUID"
-         echo "https://$domain/$EXTRA_UUID"
+        #  echo "https://$domain/$EXTRA_UUID"
          if command -v qrencode >/dev/null 2>&1; then
            echo; log "QR (Main):";  qrencode -t ANSIUTF8 "https://$domain/$UUID"  || true
-           echo; log "QR (Guest):"; qrencode -t ANSIUTF8 "https://$domain/$EXTRA_UUID" || true
+          #  echo; log "QR (Guest):"; qrencode -t ANSIUTF8 "https://$domain/$EXTRA_UUID" || true
          fi
       ;;
       3) generate_subscription ;;
