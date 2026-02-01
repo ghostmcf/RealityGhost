@@ -1,6 +1,8 @@
 # RealityGhost v3.6.1
 ### Dual-Mode Xray Reality (XHTTP / TCP) with Stealth HTTPS Subscription
 
+❌❌❌ توجه فرمایید کد در حالت تست است و تا دو روز آینده رفع اشکال میشود❌❌❌
+
 RealityGhost یک اسکریپت **production‑grade، ایمن و stealth‑محور** برای راه‌اندازی و مدیریت Xray Reality (VLESS) است که بر اساس **مشاهدات میدانی، لاگ‌های عملیاتی و گزارش‌های واقعی از نحوه فیلترینگ در ایران** طراحی شده است.
 
 این پروژه مخصوص استفاده طولانی‌مدت در شرایط فشار شدید DPI و Active Probing نوشته شده، نه صرفاً تست.
